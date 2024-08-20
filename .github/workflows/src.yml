@@ -1,0 +1,140 @@
+name: Source
+
+on:
+  push:
+    branches:
+      - src
+  pull_request:
+    branches:
+      - src
+
+jobs:
+  local:
+    name: Local test
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        python-version: [ '3.8.2', '3.9', '3.10', '3.11', '3.12' ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Configure git
+        run: |
+          git config --global user.email "dev@babyMRI.org"
+          git config --global user.name "FNNDSC in Github Actions"
+      - name: Run ./bootstrap.sh
+        run: |
+          sed -i -e 's/#READY=yes/READY=yes/' bootstrap.sh
+          ./bootstrap.sh
+      - name: Generated unit tests
+        run: |
+          source venv/bin/activate
+          pytest
+      - name: Run program
+        run: |
+          source venv/bin/activate
+          mkdir /tmp/incoming
+          echo 'on-the-metal test is very testy test test' > /tmp/incoming/ghaction.txt
+          commandname --word 'test' /tmp/incoming /tmp/outgoing
+
+          if ! [ -e '/tmp/outgoing/ghaction.count.txt' ]; then
+            echo "Contents of /tmp/outgoing: " /tmp/outgoing/*
+            echo "::error ::File outgoing/ghaction.count.txt was not created."
+          fi
+
+          rm -rvf /tmp/incoming /tmp/outgoing
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Edit code
+        run: |
+          git config --global user.email "dev@babyMRI.org"
+          git config --global user.name "FNNDSC in Github Actions"
+
+          temp_file=$(mktemp)
+          sed 's/#READY=yes/READY=yes/' bootstrap.sh \
+            | sed 's/^PLUGIN_NAME=.*/PLUGIN_NAME=pl-ghactions-testtemplate/' \
+            | sed 's/^SCRIPT_NAME=.*/SCRIPT_NAME=ghtest_template/' \
+            | sed 's/^PLUGIN_TITLE=.*/PLUGIN_TITLE="A test in GH Actions"/' \
+            > $temp_file
+          mv $temp_file ./bootstrap.sh
+
+          chmod +x bootstrap.sh
+          ./bootstrap.sh
+
+          if ! [ -f ghtest_template.py ]; then
+            echo "::error ::File ghtest_template.py was not created."
+            exit 1
+          fi
+
+          # change the version of this ChRIS plugin
+          sed -i -e 's/^__version__ = .*/__version__ = "1.2.3"/' ghtest_template.py
+      - name: Build image
+        run: docker build -t localhost/fnndsc/pl-ghactions-testtemplate:1.2.3 .
+      - name: Spin up ChRIS
+        uses: FNNDSC/miniChRIS-docker@master
+        with:
+          plugins: localhost/fnndsc/pl-ghactions-testtemplate:1.2.3
+      - name: Assert plugin registered
+        run: |
+          qs='name_exact=pl-ghactions-testtemplate&version=1.2.3'
+          res="$(
+            curl -u 'chris:chris1234' \
+              -H 'Accept: application/json' \
+              "http://localhost:8000/api/v1/plugins/search/?$qs"
+          )"
+          
+          count="$(jq -r '.count' <<< "$res")"
+          if [ "$count" != '1' ]; then
+            echo "::error ::expected count=1"
+            echo "$res"
+            exit 1
+          fi
+
+  push:
+    name: Push to main
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: [ local, integration ]
+    steps:
+    - name: Git checkout
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Configure git
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+    - name: Merge ref into main
+      run: |
+        git switch main
+
+        set +e
+        output="$(git merge --no-ff --no-commit ${{ github.ref }})"
+        set -e
+        echo "$output"
+
+        # ignore merge conflicts to this file
+        filtered="$(sed '/CONFLICT (modify\/delete): \.github\/workflows\/src\.yml/d' <<< "$output")"
+        if ( echo "$filtered" | grep -Fq CONFLICT ); then
+          echo "::error ::Unacceptable merge conflict. Someone changed main, please merge manually."
+          exit 1
+        fi
+
+        # Important! Deletes this Github workflow file
+        if [ -e .github/workflows/src.yml ]; then
+          git rm --force .github/workflows/src.yml
+        fi
+
+        git commit --no-edit
+    - name: Push to main
+      uses: ad-m/github-push-action@552c074ed701137ebd2bf098e70c394ca293e87f
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: main
